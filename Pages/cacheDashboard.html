@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Local Cache</title>
+    <style>
+        .lc-usage-bar { background: #333; border-radius: 4px; overflow: hidden; height: 24px; margin-bottom: 8px; }
+        .lc-usage-fill { background: #00a4dc; height: 100%; transition: width 0.3s; }
+        .lc-usage-fill.warning { background: #d2691e; }
+        .lc-usage-fill.critical { background: #cc3333; }
+        .lc-table { width: 100%; border-collapse: collapse; }
+        .lc-table th, .lc-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }
+        .lc-table th { font-weight: bold; color: #aaa; font-size: 0.85em; text-transform: uppercase; }
+        .lc-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.8em; font-weight: bold; }
+        .lc-badge.cached { background: #2e7d32; color: white; }
+        .lc-badge.copying { background: #1565c0; color: white; }
+        .lc-badge.failed { background: #c62828; color: white; }
+        .lc-progress { background: #333; border-radius: 3px; height: 6px; overflow: hidden; display: inline-block; width: 100px; vertical-align: middle; margin-left: 8px; }
+        .lc-progress-fill { background: #00a4dc; height: 100%; transition: width 0.5s; }
+        .lc-btn { cursor: pointer; padding: 4px 12px; border-radius: 3px; border: none; font-size: 0.85em; }
+        .lc-btn-cache { background: #00a4dc; color: white; }
+        .lc-btn-evict { background: #c62828; color: white; }
+        .lc-btn:disabled { opacity: 0.5; cursor: default; }
+        .lc-empty { color: #888; padding: 16px 0; }
+        .lc-size { color: #aaa; white-space: nowrap; }
+        .lc-search { margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <div id="localCachePage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-button,emby-input">
+        <div data-role="content">
+            <div class="content-primary">
+                <h1>Local Cache Manager</h1>
+
+                <!-- Disk usage -->
+                <div class="verticalSection">
+                    <h2>Disk Usage</h2>
+                    <div class="lc-usage-bar"><div id="usageBar" class="lc-usage-fill"></div></div>
+                    <p id="usageText" style="margin:0;color:#aaa;"></p>
+                </div>
+
+                <!-- Active copies -->
+                <div id="activeCopiesSection" class="verticalSection" style="display:none;">
+                    <h2>Active Copies</h2>
+                    <div id="activeCopiesList"></div>
+                </div>
+
+                <!-- Cached items -->
+                <div class="verticalSection">
+                    <h2>Cached Items</h2>
+                    <div id="cachedItemsList"></div>
+                </div>
+
+                <!-- Browse items -->
+                <div class="verticalSection">
+                    <h2>Browse Library</h2>
+                    <div class="lc-search">
+                        <input is="emby-input" type="text" id="searchBox" label="Search movies and episodes..." />
+                    </div>
+                    <div id="itemsList"></div>
+                    <div style="text-align:center;margin-top:12px;">
+                        <button is="emby-button" id="loadMoreBtn" class="raised" style="display:none;">
+                            <span>Load More</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script type="text/javascript">
+            (function () {
+                'use strict';
+
+                var pollTimer = null;
+                var browseOffset = 0;
+                var browseLimit = 30;
+                var searchTimeout = null;
+
+                function apiFetch(path, method) {
+                    return ApiClient.fetch({
+                        url: ApiClient.getUrl(path),
+                        type: method || 'GET',
+                        dataType: 'json',
+                        headers: { accept: 'application/json' }
+                    });
+                }
+
+                function apiPost(path) {
+                    return ApiClient.fetch({
+                        url: ApiClient.getUrl(path),
+                        type: 'POST',
+                        dataType: 'json',
+                        headers: { accept: 'application/json' }
+                    });
+                }
+
+                function apiDelete(path) {
+                    return ApiClient.fetch({
+                        url: ApiClient.getUrl(path),
+                        type: 'DELETE'
+                    });
+                }
+
+                function formatBytes(bytes) {
+                    if (bytes == null) return '?';
+                    if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
+                    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+                    return (bytes / 1024).toFixed(1) + ' KB';
+                }
+
+                function formatDuration(ticks) {
+                    if (!ticks) return '';
+                    var mins = Math.round(ticks / 600000000);
+                    if (mins >= 60) return Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+                    return mins + 'm';
+                }
+
+                function itemDisplayName(item) {
+                    if (item.SeriesName) {
+                        var name = item.SeriesName;
+                        if (item.SeasonName) name += ' - ' + item.SeasonName;
+                        if (item.IndexNumber != null) name += ' E' + item.IndexNumber;
+                        name += ' - ' + item.Name;
+                        return name;
+                    }
+                    return item.Name;
+                }
+
+                // --- Render functions ---
+
+                function renderUsage(status) {
+                    var bar = document.getElementById('usageBar');
+                    var text = document.getElementById('usageText');
+                    var used = status.UsedCacheSizeBytes;
+                    var max = status.MaxCacheSizeBytes;
+                    var pct = max > 0 ? Math.min(100, (used / max) * 100) : 0;
+
+                    bar.style.width = pct.toFixed(1) + '%';
+                    bar.className = 'lc-usage-fill' + (pct > 90 ? ' critical' : pct > 70 ? ' warning' : '');
+
+                    if (max > 0) {
+                        text.textContent = formatBytes(used) + ' / ' + formatBytes(max) +
+                            ' (' + pct.toFixed(1) + '%) \u2014 ' +
+                            status.CachedItemCount + ' item' + (status.CachedItemCount !== 1 ? 's' : '') + ' cached';
+                    } else {
+                        text.textContent = formatBytes(used) + ' used (no limit) \u2014 ' +
+                            status.CachedItemCount + ' item' + (status.CachedItemCount !== 1 ? 's' : '') + ' cached';
+                    }
+                }
+
+                function renderCachedItems(entries) {
+                    var container = document.getElementById('cachedItemsList');
+                    var cached = entries.filter(function (e) { return e.State === 'Cached'; });
+
+                    if (cached.length === 0) {
+                        container.innerHTML = '<p class="lc-empty">No items cached yet. Use the browser below to cache items.</p>';
+                        return;
+                    }
+
+                    // Sort by last accessed (most recent first), then by cached date
+                    cached.sort(function (a, b) {
+                        var da = a.LastAccessedAt || a.CachedAt || '';
+                        var db = b.LastAccessedAt || b.CachedAt || '';
+                        return db.localeCompare(da);
+                    });
+
+                    var html = '<table class="lc-table"><thead><tr>' +
+                        '<th>Item</th><th>Size</th><th>Cached</th><th></th>' +
+                        '</tr></thead><tbody>';
+
+                    cached.forEach(function (entry) {
+                        var cachedDate = entry.CachedAt ? new Date(entry.CachedAt).toLocaleDateString() : '';
+                        html += '<tr>' +
+                            '<td>' + escapeHtml(entry.SourcePath.split('/').pop()) + '</td>' +
+                            '<td class="lc-size">' + formatBytes(entry.FileSize) + '</td>' +
+                            '<td>' + cachedDate + '</td>' +
+                            '<td><button class="lc-btn lc-btn-evict" data-evict="' + entry.ItemId + '">Evict</button></td>' +
+                            '</tr>';
+                    });
+
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+
+                    container.querySelectorAll('[data-evict]').forEach(function (btn) {
+                        btn.addEventListener('click', function () {
+                            var id = this.getAttribute('data-evict');
+                            this.disabled = true;
+                            this.textContent = '...';
+                            apiDelete('LocalCache/Cache/' + id).then(refreshAll);
+                        });
+                    });
+                }
+
+                function renderActiveCopies(entries) {
+                    var section = document.getElementById('activeCopiesSection');
+                    var container = document.getElementById('activeCopiesList');
+                    var copying = entries.filter(function (e) { return e.State === 'Copying'; });
+
+                    if (copying.length === 0) {
+                        section.style.display = 'none';
+                        stopPolling();
+                        return;
+                    }
+
+                    section.style.display = '';
+                    startPolling();
+
+                    var html = '';
+                    copying.forEach(function (entry) {
+                        html += '<div style="margin-bottom:12px;">' +
+                            '<span>' + escapeHtml(entry.SourcePath.split('/').pop()) + '</span>' +
+                            ' <span class="lc-badge copying">Copying</span>' +
+                            '<div id="progress-' + entry.ItemId + '" style="margin-top:4px;">' +
+                            '<div class="lc-progress"><div class="lc-progress-fill" style="width:0%"></div></div>' +
+                            ' <span class="lc-size">starting...</span>' +
+                            '</div>' +
+                            '</div>';
+                    });
+
+                    container.innerHTML = html;
+
+                    // Fetch progress for each
+                    copying.forEach(function (entry) {
+                        updateProgress(entry.ItemId);
+                    });
+                }
+
+                function updateProgress(itemId) {
+                    apiFetch('LocalCache/Progress/' + itemId).then(function (prog) {
+                        var el = document.getElementById('progress-' + itemId);
+                        if (!el) return;
+                        var fill = el.querySelector('.lc-progress-fill');
+                        var text = el.querySelector('.lc-size');
+                        if (fill) fill.style.width = prog.ProgressPercent.toFixed(1) + '%';
+                        if (text) text.textContent = formatBytes(prog.BytesCopied) + ' / ' + formatBytes(prog.TotalBytes) +
+                            ' (' + prog.ProgressPercent.toFixed(1) + '%)';
+                    });
+                }
+
+                function renderBrowseItems(items, append) {
+                    var container = document.getElementById('itemsList');
+                    var btn = document.getElementById('loadMoreBtn');
+
+                    if (!append) {
+                        container.innerHTML = '';
+                    }
+
+                    if (items.length === 0 && !append) {
+                        container.innerHTML = '<p class="lc-empty">No cacheable items found. Check your slow path prefixes in settings.</p>';
+                        btn.style.display = 'none';
+                        return;
+                    }
+
+                    var html = '';
+                    if (!append) {
+                        html = '<table class="lc-table"><thead><tr>' +
+                            '<th>Name</th><th>Size</th><th>Duration</th><th>Status</th><th></th>' +
+                            '</tr></thead><tbody id="browseBody">';
+                    }
+
+                    items.forEach(function (item) {
+                        var stateHtml = '';
+                        var actionHtml = '';
+
+                        if (item.CacheState === 'Cached') {
+                            stateHtml = '<span class="lc-badge cached">Cached</span>';
+                            actionHtml = '<button class="lc-btn lc-btn-evict" data-evict="' + item.ItemId + '">Evict</button>';
+                        } else if (item.CacheState === 'Copying') {
+                            stateHtml = '<span class="lc-badge copying">Copying</span>';
+                            if (item.CopyProgress != null) {
+                                stateHtml += ' ' + item.CopyProgress.toFixed(1) + '%';
+                            }
+                        } else if (item.CacheState === 'Failed') {
+                            stateHtml = '<span class="lc-badge failed">Failed</span>';
+                            actionHtml = '<button class="lc-btn lc-btn-cache" data-cache="' + item.ItemId + '">Retry</button>';
+                        } else {
+                            actionHtml = '<button class="lc-btn lc-btn-cache" data-cache="' + item.ItemId + '">Cache</button>';
+                        }
+
+                        html += '<tr>' +
+                            '<td>' + escapeHtml(itemDisplayName(item)) + '</td>' +
+                            '<td class="lc-size">' + formatBytes(item.FileSize) + '</td>' +
+                            '<td>' + formatDuration(item.RunTimeTicks) + '</td>' +
+                            '<td>' + stateHtml + '</td>' +
+                            '<td>' + actionHtml + '</td>' +
+                            '</tr>';
+                    });
+
+                    if (!append) {
+                        html += '</tbody></table>';
+                        container.innerHTML = html;
+                    } else {
+                        var body = document.getElementById('browseBody');
+                        if (body) {
+                            body.insertAdjacentHTML('beforeend', html);
+                        }
+                    }
+
+                    btn.style.display = items.length >= browseLimit ? '' : 'none';
+
+                    // Bind cache buttons
+                    container.querySelectorAll('[data-cache]').forEach(function (cacheBtn) {
+                        cacheBtn.addEventListener('click', function () {
+                            var id = this.getAttribute('data-cache');
+                            this.disabled = true;
+                            this.textContent = '...';
+                            apiPost('LocalCache/Cache/' + id).then(function () {
+                                refreshAll();
+                            }, function (err) {
+                                alert('Cache failed. Check plugin settings and disk space.');
+                                refreshAll();
+                            });
+                        });
+                    });
+
+                    // Bind evict buttons in browse table
+                    container.querySelectorAll('[data-evict]').forEach(function (evictBtn) {
+                        evictBtn.addEventListener('click', function () {
+                            var id = this.getAttribute('data-evict');
+                            this.disabled = true;
+                            this.textContent = '...';
+                            apiDelete('LocalCache/Cache/' + id).then(refreshAll);
+                        });
+                    });
+                }
+
+                // --- Polling ---
+
+                function startPolling() {
+                    if (pollTimer) return;
+                    pollTimer = setInterval(function () {
+                        apiFetch('LocalCache/Status').then(function (status) {
+                            renderUsage(status);
+                            renderCachedItems(status.Entries);
+                            renderActiveCopies(status.Entries);
+
+                            if (status.CopyingItemCount === 0) {
+                                stopPolling();
+                                loadBrowseItems(false);
+                            }
+                        });
+                    }, 2000);
+                }
+
+                function stopPolling() {
+                    if (pollTimer) {
+                        clearInterval(pollTimer);
+                        pollTimer = null;
+                    }
+                }
+
+                // --- Data loading ---
+
+                function refreshAll() {
+                    apiFetch('LocalCache/Status').then(function (status) {
+                        renderUsage(status);
+                        renderCachedItems(status.Entries);
+                        renderActiveCopies(status.Entries);
+                    });
+                    loadBrowseItems(false);
+                }
+
+                function loadBrowseItems(append) {
+                    if (!append) browseOffset = 0;
+                    var search = document.getElementById('searchBox').value;
+                    var url = 'LocalCache/Items?startIndex=' + browseOffset + '&limit=' + browseLimit;
+                    if (search) url += '&searchTerm=' + encodeURIComponent(search);
+
+                    apiFetch(url).then(function (items) {
+                        renderBrowseItems(items, append);
+                        browseOffset += items.length;
+                    });
+                }
+
+                function escapeHtml(str) {
+                    var div = document.createElement('div');
+                    div.textContent = str || '';
+                    return div.innerHTML;
+                }
+
+                // --- Event bindings ---
+
+                document.querySelector('#localCachePage')
+                    .addEventListener('pageshow', function () {
+                        refreshAll();
+                    });
+
+                document.getElementById('searchBox')
+                    .addEventListener('input', function () {
+                        if (searchTimeout) clearTimeout(searchTimeout);
+                        searchTimeout = setTimeout(function () {
+                            loadBrowseItems(false);
+                        }, 400);
+                    });
+
+                document.getElementById('loadMoreBtn')
+                    .addEventListener('click', function () {
+                        loadBrowseItems(true);
+                    });
+            })();
+        </script>
+    </div>
+</body>
+</html>
