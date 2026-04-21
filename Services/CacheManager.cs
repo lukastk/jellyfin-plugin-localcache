@@ -8,8 +8,10 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.LocalCache.Models;
+using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.LocalCache.Services;
@@ -22,6 +24,7 @@ public class CacheManager : ICacheManager, IDisposable
     private const int BufferSize = 4 * 1024 * 1024; // 4 MB
 
     private readonly ILibraryManager _libraryManager;
+    private readonly IServerConfigurationManager _configManager;
     private readonly ILogger<CacheManager> _logger;
     private readonly ConcurrentDictionary<Guid, CacheEntry> _entries = new();
     private readonly ConcurrentDictionary<Guid, CopyOperation> _activeOperations = new();
@@ -33,10 +36,15 @@ public class CacheManager : ICacheManager, IDisposable
     /// Initializes a new instance of the <see cref="CacheManager"/> class.
     /// </summary>
     /// <param name="libraryManager">Library manager.</param>
+    /// <param name="configManager">Server configuration manager.</param>
     /// <param name="logger">Logger.</param>
-    public CacheManager(ILibraryManager libraryManager, ILogger<CacheManager> logger)
+    public CacheManager(
+        ILibraryManager libraryManager,
+        IServerConfigurationManager configManager,
+        ILogger<CacheManager> logger)
     {
         _libraryManager = libraryManager;
+        _configManager = configManager;
         _logger = logger;
 
         var dataFolder = Plugin.Instance?.DataFolderPath
@@ -47,6 +55,7 @@ public class CacheManager : ICacheManager, IDisposable
 
         LoadManifest();
         RecoverFromRestart();
+        RestorePathSubstitutions();
     }
 
     /// <inheritdoc />
@@ -225,6 +234,7 @@ public class CacheManager : ICacheManager, IDisposable
 
         if (_entries.TryRemove(itemId, out var entry))
         {
+            RemovePathSubstitution(entry.SourcePath);
             TryDeleteFile(entry.CachedPath);
             _logger.LogInformation("Evicted cached item {ItemId}", itemId);
         }
@@ -330,11 +340,12 @@ public class CacheManager : ICacheManager, IDisposable
                 op.BytesCopied += bytesRead;
             }
 
-            // Mark as cached
+            // Mark as cached and add path substitution
             if (_entries.TryGetValue(itemId, out var entry))
             {
                 entry.State = CacheState.Cached;
                 entry.CachedAt = DateTime.UtcNow;
+                AddPathSubstitution(entry.SourcePath, entry.CachedPath);
             }
 
             _logger.LogInformation(
@@ -447,6 +458,48 @@ public class CacheManager : ICacheManager, IDisposable
         finally
         {
             _persistLock.Release();
+        }
+    }
+
+    private void AddPathSubstitution(string fromPath, string toPath)
+    {
+        var config = _configManager.Configuration;
+        var subs = config.PathSubstitutions.ToList();
+
+        // Remove any existing substitution for this path
+        subs.RemoveAll(s => string.Equals(s.From, fromPath, StringComparison.Ordinal));
+
+        // Insert at the beginning so it matches before broader prefix rules
+        subs.Insert(0, new PathSubstitution { From = fromPath, To = toPath });
+
+        config.PathSubstitutions = subs.ToArray();
+        _configManager.SaveConfiguration();
+        _logger.LogInformation("Added path substitution: {From} -> {To}", fromPath, toPath);
+    }
+
+    private void RemovePathSubstitution(string fromPath)
+    {
+        var config = _configManager.Configuration;
+        var subs = config.PathSubstitutions.ToList();
+        var removed = subs.RemoveAll(s => string.Equals(s.From, fromPath, StringComparison.Ordinal));
+
+        if (removed > 0)
+        {
+            config.PathSubstitutions = subs.ToArray();
+            _configManager.SaveConfiguration();
+            _logger.LogInformation("Removed path substitution for {From}", fromPath);
+        }
+    }
+
+    private void RestorePathSubstitutions()
+    {
+        // Ensure all cached entries have their path substitutions active
+        foreach (var entry in _entries.Values)
+        {
+            if (entry.State == CacheState.Cached && File.Exists(entry.CachedPath))
+            {
+                AddPathSubstitution(entry.SourcePath, entry.CachedPath);
+            }
         }
     }
 

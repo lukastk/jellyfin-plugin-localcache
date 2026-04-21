@@ -6,14 +6,6 @@
     var currentItemId = null;
     var injectedButton = null;
 
-    function getApiHeaders() {
-        var client = window.ApiClient;
-        if (!client) return null;
-        var token = client.accessToken();
-        if (!token) return null;
-        return { 'Authorization': 'MediaBrowser Token="' + token + '"' };
-    }
-
     function fetchCacheState(itemId, callback) {
         var client = window.ApiClient;
         if (!client) return;
@@ -37,7 +29,7 @@
             type: 'POST'
         }).then(function () {
             pollProgress(itemId, btn);
-        }, function (err) {
+        }, function () {
             btn.disabled = false;
             btn.querySelector('.detailButton-content').textContent = 'Cache Failed';
             setTimeout(function () { updateButton(btn, itemId, null); }, 3000);
@@ -125,7 +117,6 @@
             return;
         }
 
-        // Don't re-inject for the same item
         if (itemId === currentItemId && injectedButton && document.contains(injectedButton)) {
             return;
         }
@@ -140,7 +131,6 @@
         container.appendChild(btn);
         injectedButton = btn;
 
-        // Check current cache state
         fetchCacheState(itemId, function (state) {
             updateButton(btn, itemId, state);
         });
@@ -153,23 +143,18 @@
         injectedButton = null;
     }
 
-    // Monitor page changes
-    var observer = new MutationObserver(function () {
-        tryInject();
-    });
+    var observer = new MutationObserver(function () { tryInject(); });
 
     function startObserving() {
         var root = document.getElementById('reactRoot') || document.body;
         observer.observe(root, { childList: true, subtree: true });
     }
 
-    // Also listen for hash changes (SPA navigation)
     window.addEventListener('hashchange', function () {
         currentItemId = null;
         setTimeout(tryInject, 500);
     });
 
-    // Initial setup
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', function () {
             startObserving();

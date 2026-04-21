@@ -8,6 +8,7 @@ using Jellyfin.Plugin.LocalCache.Services;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Logging;
 
@@ -66,7 +67,7 @@ public class LocalCacheMediaSourceProvider : IMediaSourceProvider
 
         var cachedSource = new MediaSourceInfo
         {
-            Id = item.Id.ToString("N", CultureInfo.InvariantCulture) + "_localcache",
+            Id = original.Id,
             Path = cachedPath,
             Protocol = MediaProtocol.File,
             Name = (original.Name ?? "Unknown") + suffix,
@@ -78,7 +79,7 @@ public class LocalCacheMediaSourceProvider : IMediaSourceProvider
             IsoType = original.IsoType,
             Video3DFormat = original.Video3DFormat,
             Timestamp = original.Timestamp,
-            MediaStreams = original.MediaStreams,
+            MediaStreams = CloneMediaStreamsWithSortBoost(original.MediaStreams),
             MediaAttachments = original.MediaAttachments,
             Formats = original.Formats,
             Type = MediaSourceType.Default,
@@ -101,6 +102,61 @@ public class LocalCacheMediaSourceProvider : IMediaSourceProvider
             cachedPath);
 
         return Task.FromResult<IEnumerable<MediaSourceInfo>>([cachedSource]);
+    }
+
+    /// <summary>
+    /// Clones the media streams list with a +1 width boost on the video stream.
+    /// This ensures the cached source sorts before the original in SortMediaSources
+    /// (which sorts descending by video width), so the player auto-selects it.
+    /// </summary>
+    private static IReadOnlyList<MediaStream> CloneMediaStreamsWithSortBoost(
+        IReadOnlyList<MediaStream> original)
+    {
+        var cloned = new List<MediaStream>(original.Count);
+        foreach (var stream in original)
+        {
+            if (stream.Type == MediaStreamType.Video && stream.Width.HasValue)
+            {
+                // Shallow copy with boosted width for sort priority
+                cloned.Add(new MediaStream
+                {
+                    Type = stream.Type,
+                    Index = stream.Index,
+                    Codec = stream.Codec,
+                    CodecTag = stream.CodecTag,
+                    Language = stream.Language,
+                    Title = stream.Title,
+                    Width = stream.Width.Value + 1,
+                    Height = stream.Height,
+                    BitRate = stream.BitRate,
+                    BitDepth = stream.BitDepth,
+                    AverageFrameRate = stream.AverageFrameRate,
+                    RealFrameRate = stream.RealFrameRate,
+                    Profile = stream.Profile,
+                    Level = stream.Level,
+                    AspectRatio = stream.AspectRatio,
+                    PixelFormat = stream.PixelFormat,
+                    IsDefault = stream.IsDefault,
+                    IsForced = stream.IsForced,
+                    IsInterlaced = stream.IsInterlaced,
+                    IsAVC = stream.IsAVC,
+                    Channels = stream.Channels,
+                    SampleRate = stream.SampleRate,
+                    IsExternal = stream.IsExternal,
+                    NalLengthSize = stream.NalLengthSize,
+                    ColorRange = stream.ColorRange,
+                    ColorSpace = stream.ColorSpace,
+                    ColorTransfer = stream.ColorTransfer,
+                    ColorPrimaries = stream.ColorPrimaries,
+                });
+            }
+            else
+            {
+                cloned.Add(stream);
+            }
+        }
+
+        return cloned;
     }
 
     /// <inheritdoc />
