@@ -30,6 +30,7 @@
         <div data-role="content">
             <div class="content-primary">
                 <h1>Local Cache Manager</h1>
+                <p><a href="#!/configurationpage?name=Local Cache" style="color:#00a4dc;">Settings (cache directory, slow paths, max size)</a></p>
 
                 <!-- Disk usage -->
                 <div class="verticalSection">
@@ -87,9 +88,7 @@
                 function apiPost(path) {
                     return ApiClient.fetch({
                         url: ApiClient.getUrl(path),
-                        type: 'POST',
-                        dataType: 'json',
-                        headers: { accept: 'application/json' }
+                        type: 'POST'
                     });
                 }
 
@@ -306,7 +305,12 @@
                             apiPost('LocalCache/Cache/' + id).then(function () {
                                 refreshAll();
                             }, function (err) {
-                                alert('Cache failed. Check plugin settings and disk space.');
+                                var msg = 'Cache failed.';
+                                if (err && err.text) {
+                                    err.text().then(function (t) { alert(msg + ' ' + t); });
+                                } else {
+                                    alert(msg);
+                                }
                                 refreshAll();
                             });
                         });
