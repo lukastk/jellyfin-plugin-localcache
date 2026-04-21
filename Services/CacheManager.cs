@@ -7,11 +7,12 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.LocalCache.Models;
+using MediaBrowser.Controller.Collections;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
-using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -25,6 +26,7 @@ public class CacheManager : ICacheManager, IDisposable
     private const int BufferSize = 4 * 1024 * 1024; // 4 MB
 
     private readonly ILibraryManager _libraryManager;
+    private readonly ICollectionManager _collectionManager;
     private readonly IServerConfigurationManager _configManager;
     private readonly ILogger<CacheManager> _logger;
     private readonly ConcurrentDictionary<Guid, CacheEntry> _entries = new();
@@ -37,14 +39,17 @@ public class CacheManager : ICacheManager, IDisposable
     /// Initializes a new instance of the <see cref="CacheManager"/> class.
     /// </summary>
     /// <param name="libraryManager">Library manager.</param>
+    /// <param name="collectionManager">Collection manager.</param>
     /// <param name="configManager">Server configuration manager.</param>
     /// <param name="logger">Logger.</param>
     public CacheManager(
         ILibraryManager libraryManager,
+        ICollectionManager collectionManager,
         IServerConfigurationManager configManager,
         ILogger<CacheManager> logger)
     {
         _libraryManager = libraryManager;
+        _collectionManager = collectionManager;
         _configManager = configManager;
         _logger = logger;
 
@@ -237,7 +242,7 @@ public class CacheManager : ICacheManager, IDisposable
         {
             RemovePathSubstitution(entry.SourcePath);
             TryDeleteFile(entry.CachedPath);
-            _ = SetCacheTagAsync(itemId, add: false);
+            _ = UpdateCollectionAsync(itemId, add: false);
             _logger.LogInformation("Evicted cached item {ItemId}", itemId);
         }
 
@@ -348,7 +353,7 @@ public class CacheManager : ICacheManager, IDisposable
                 entry.State = CacheState.Cached;
                 entry.CachedAt = DateTime.UtcNow;
                 AddPathSubstitution(entry.SourcePath, entry.CachedPath);
-                _ = SetCacheTagAsync(itemId, add: true);
+                _ = UpdateCollectionAsync(itemId, add: true);
             }
 
             _logger.LogInformation(
@@ -464,37 +469,82 @@ public class CacheManager : ICacheManager, IDisposable
         }
     }
 
-    private const string CacheTag = "Cached Locally";
+    private const string CollectionName = "Cached Locally";
 
-    private async Task SetCacheTagAsync(Guid itemId, bool add)
+    private Guid? _collectionId;
+
+    private async Task<Guid?> GetOrCreateCollectionAsync()
+    {
+        if (_collectionId.HasValue)
+        {
+            // Verify it still exists
+            var existing = _libraryManager.GetItemById(_collectionId.Value);
+            if (existing is not null)
+            {
+                return _collectionId.Value;
+            }
+
+            _collectionId = null;
+        }
+
+        // Search for existing collection by name
+        var items = _libraryManager.GetItemList(new InternalItemsQuery
+        {
+            IncludeItemTypes = [BaseItemKind.BoxSet],
+            Name = CollectionName,
+            Recursive = true,
+        });
+
+        if (items.Count > 0)
+        {
+            _collectionId = items[0].Id;
+            return _collectionId.Value;
+        }
+
+        // Create new collection
+        try
+        {
+            var boxSet = await _collectionManager.CreateCollectionAsync(new CollectionCreationOptions
+            {
+                Name = CollectionName,
+                IsLocked = true,
+            }).ConfigureAwait(false);
+
+            _collectionId = boxSet.Id;
+            _logger.LogInformation("Created '{Name}' collection: {Id}", CollectionName, boxSet.Id);
+            return _collectionId.Value;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create '{Name}' collection", CollectionName);
+            return null;
+        }
+    }
+
+    private async Task UpdateCollectionAsync(Guid itemId, bool add)
     {
         try
         {
-            var item = _libraryManager.GetItemById(itemId);
-            if (item is null)
+            var collectionId = await GetOrCreateCollectionAsync().ConfigureAwait(false);
+            if (!collectionId.HasValue)
             {
                 return;
             }
 
-            var tags = new List<string>(item.Tags);
-            if (add && !tags.Contains(CacheTag, StringComparer.OrdinalIgnoreCase))
+            if (add)
             {
-                tags.Add(CacheTag);
-                item.Tags = tags.ToArray();
-                await _libraryManager.UpdateItemAsync(item, item.GetParent(), ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
-                _logger.LogInformation("Added '{Tag}' tag to {ItemId}", CacheTag, itemId);
+                await _collectionManager.AddToCollectionAsync(collectionId.Value, [itemId]).ConfigureAwait(false);
+                _logger.LogInformation("Added {ItemId} to '{Name}' collection", itemId, CollectionName);
             }
-            else if (!add && tags.Contains(CacheTag, StringComparer.OrdinalIgnoreCase))
+            else
             {
-                tags.RemoveAll(t => string.Equals(t, CacheTag, StringComparison.OrdinalIgnoreCase));
-                item.Tags = tags.ToArray();
-                await _libraryManager.UpdateItemAsync(item, item.GetParent(), ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
-                _logger.LogInformation("Removed '{Tag}' tag from {ItemId}", CacheTag, itemId);
+                await _collectionManager.RemoveFromCollectionAsync(collectionId.Value, [itemId]).ConfigureAwait(false);
+                _logger.LogInformation("Removed {ItemId} from '{Name}' collection", itemId, CollectionName);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to update cache tag for {ItemId}", itemId);
+            _logger.LogError(ex, "Failed to update collection for {ItemId}", itemId);
         }
     }
 
@@ -530,13 +580,31 @@ public class CacheManager : ICacheManager, IDisposable
 
     private void RestorePathSubstitutions()
     {
-        // Ensure all cached entries have their path substitutions and tags
+        // Ensure all cached entries have their path substitutions
         foreach (var entry in _entries.Values)
         {
             if (entry.State == CacheState.Cached && File.Exists(entry.CachedPath))
             {
                 AddPathSubstitution(entry.SourcePath, entry.CachedPath);
-                _ = SetCacheTagAsync(entry.ItemId, add: true);
+            }
+        }
+
+        // Defer collection sync — the collection manager isn't ready during startup
+        _ = Task.Run(async () =>
+        {
+            // Wait for Jellyfin to finish starting
+            await Task.Delay(15_000).ConfigureAwait(false);
+            await SyncCollectionAsync().ConfigureAwait(false);
+        });
+    }
+
+    private async Task SyncCollectionAsync()
+    {
+        foreach (var entry in _entries.Values)
+        {
+            if (entry.State == CacheState.Cached)
+            {
+                await UpdateCollectionAsync(entry.ItemId, add: true).ConfigureAwait(false);
             }
         }
     }
