@@ -11,6 +11,7 @@ using Jellyfin.Plugin.LocalCache.Models;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -236,6 +237,7 @@ public class CacheManager : ICacheManager, IDisposable
         {
             RemovePathSubstitution(entry.SourcePath);
             TryDeleteFile(entry.CachedPath);
+            _ = SetCacheTagAsync(itemId, add: false);
             _logger.LogInformation("Evicted cached item {ItemId}", itemId);
         }
 
@@ -340,12 +342,13 @@ public class CacheManager : ICacheManager, IDisposable
                 op.BytesCopied += bytesRead;
             }
 
-            // Mark as cached and add path substitution
+            // Mark as cached, add path substitution, and tag the item
             if (_entries.TryGetValue(itemId, out var entry))
             {
                 entry.State = CacheState.Cached;
                 entry.CachedAt = DateTime.UtcNow;
                 AddPathSubstitution(entry.SourcePath, entry.CachedPath);
+                _ = SetCacheTagAsync(itemId, add: true);
             }
 
             _logger.LogInformation(
@@ -461,6 +464,40 @@ public class CacheManager : ICacheManager, IDisposable
         }
     }
 
+    private const string CacheTag = "Cached Locally";
+
+    private async Task SetCacheTagAsync(Guid itemId, bool add)
+    {
+        try
+        {
+            var item = _libraryManager.GetItemById(itemId);
+            if (item is null)
+            {
+                return;
+            }
+
+            var tags = new List<string>(item.Tags);
+            if (add && !tags.Contains(CacheTag, StringComparer.OrdinalIgnoreCase))
+            {
+                tags.Add(CacheTag);
+                item.Tags = tags.ToArray();
+                await _libraryManager.UpdateItemAsync(item, item.GetParent(), ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
+                _logger.LogInformation("Added '{Tag}' tag to {ItemId}", CacheTag, itemId);
+            }
+            else if (!add && tags.Contains(CacheTag, StringComparer.OrdinalIgnoreCase))
+            {
+                tags.RemoveAll(t => string.Equals(t, CacheTag, StringComparison.OrdinalIgnoreCase));
+                item.Tags = tags.ToArray();
+                await _libraryManager.UpdateItemAsync(item, item.GetParent(), ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
+                _logger.LogInformation("Removed '{Tag}' tag from {ItemId}", CacheTag, itemId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update cache tag for {ItemId}", itemId);
+        }
+    }
+
     private void AddPathSubstitution(string fromPath, string toPath)
     {
         var config = _configManager.Configuration;
@@ -493,12 +530,13 @@ public class CacheManager : ICacheManager, IDisposable
 
     private void RestorePathSubstitutions()
     {
-        // Ensure all cached entries have their path substitutions active
+        // Ensure all cached entries have their path substitutions and tags
         foreach (var entry in _entries.Values)
         {
             if (entry.State == CacheState.Cached && File.Exists(entry.CachedPath))
             {
                 AddPathSubstitution(entry.SourcePath, entry.CachedPath);
+                _ = SetCacheTagAsync(entry.ItemId, add: true);
             }
         }
     }
